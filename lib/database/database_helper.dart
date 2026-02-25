@@ -277,19 +277,17 @@ class DatabaseHelper {
       await userCredential.user!.sendEmailVerification();
 
       // 3. Store in Firestore with isActive: false
-      // IMPORTANT: use uid as the canonical id so lookups always match
-      final uid = userCredential.user!.uid;
-      final studentMap = {
-        ...student.toMap(),
-        'id': uid,          // override the millisecondsSinceEpoch id
-        'isActive': false,
-        'uid': uid,
-      };
-      await _firestore.collection('students').doc(uid).set(studentMap);
+      await _firestore.collection('students').doc(userCredential.user!.uid).set(
+        {
+          ...student.toMap(),
+          'isActive': false,
+          'uid': userCredential.user!.uid,
+        },
+      );
 
-      // 4. Store in local Hive (keyed by uid as well)
+      // 4. Store in local Hive
       final box = await _getBox(_studentsBoxName);
-      await box.put(uid, studentMap);
+      await box.put(student.id, {...student.toMap(), 'isActive': false});
     } catch (e) {
       throw Exception('Failed to register student: $e');
     }
@@ -309,19 +307,52 @@ class DatabaseHelper {
         throw Exception('ACCOUNT_NOT_ACTIVATED');
       }
 
-      // 3. Activate account in Firestore
       final uid = userCredential.user!.uid;
-      await _firestore.collection('students').doc(uid).set(
-        {'isActive': true},
-        SetOptions(merge: true),
-      );
 
-      // 4. Return student data — ensure 'id' field equals uid
-      final doc = await _firestore.collection('students').doc(uid).get();
+      // 3. Try to find the student doc by UID first
+      DocumentSnapshot doc =
+          await _firestore.collection('students').doc(uid).get();
+
+      if (!doc.exists) {
+        // Legacy user: document was stored under old millisecondsSinceEpoch id
+        // Find it by email and migrate to the correct UID-based document
+        final query = await _firestore
+            .collection('students')
+            .where('email', isEqualTo: email)
+            .limit(1)
+            .get();
+
+        if (query.docs.isNotEmpty) {
+          final legacyData = query.docs.first.data() as Map<String, dynamic>;
+          final legacyDocId = query.docs.first.id;
+
+          final migratedData = {
+            ...legacyData,
+            'id': uid,
+            'uid': uid,
+            'isActive': true,
+          };
+
+          await _firestore.collection('students').doc(uid).set(migratedData);
+          await _firestore.collection('students').doc(legacyDocId).delete();
+
+          final box = await _getBox(_studentsBoxName);
+          await box.delete(legacyDocId);
+          await box.put(uid, migratedData);
+
+          return Student.fromMap(migratedData);
+        }
+      }
+
+      // 4. Activate and return (normal / already-migrated user)
+      await _firestore
+          .collection('students')
+          .doc(uid)
+          .set({'isActive': true}, SetOptions(merge: true));
+
+      doc = await _firestore.collection('students').doc(uid).get();
       if (doc.exists) {
-        final data = doc.data()!;
-        // Guarantee the id stored in the model matches the Firestore doc path
-        return Student.fromMap({...data, 'id': uid});
+        return Student.fromMap({...doc.data()! as Map<String, dynamic>, 'id': uid});
       }
     } catch (e) {
       rethrow;
@@ -418,21 +449,13 @@ class DatabaseHelper {
 
   Future<void> updateStudentProfile(String id, Map<String, dynamic> data) async {
     try {
-      // Use set+merge so it works even if the document doesn't exist yet
-      await _firestore
-          .collection('students')
-          .doc(id)
-          .set(data, SetOptions(merge: true));
-
+      await _firestore.collection('students').doc(id).update(data);
       final box = await _getBox(_studentsBoxName);
       final currentData = box.get(id);
       if (currentData != null) {
         final updatedData = Map<String, dynamic>.from(currentData);
         updatedData.addAll(data);
         await box.put(id, updatedData);
-      } else {
-        // If not in Hive yet, store the partial data so future reads work
-        await box.put(id, data);
       }
     } catch (e) {
       throw Exception('Failed to update student profile: $e');
