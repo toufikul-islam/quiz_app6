@@ -277,17 +277,19 @@ class DatabaseHelper {
       await userCredential.user!.sendEmailVerification();
 
       // 3. Store in Firestore with isActive: false
-      await _firestore.collection('students').doc(userCredential.user!.uid).set(
-        {
-          ...student.toMap(),
-          'isActive': false,
-          'uid': userCredential.user!.uid,
-        },
-      );
+      // IMPORTANT: use uid as the canonical id so lookups always match
+      final uid = userCredential.user!.uid;
+      final studentMap = {
+        ...student.toMap(),
+        'id': uid,          // override the millisecondsSinceEpoch id
+        'isActive': false,
+        'uid': uid,
+      };
+      await _firestore.collection('students').doc(uid).set(studentMap);
 
-      // 4. Store in local Hive
+      // 4. Store in local Hive (keyed by uid as well)
       final box = await _getBox(_studentsBoxName);
-      await box.put(student.id, {...student.toMap(), 'isActive': false});
+      await box.put(uid, studentMap);
     } catch (e) {
       throw Exception('Failed to register student: $e');
     }
@@ -309,14 +311,17 @@ class DatabaseHelper {
 
       // 3. Activate account in Firestore
       final uid = userCredential.user!.uid;
-      await _firestore.collection('students').doc(uid).update({
-        'isActive': true,
-      });
+      await _firestore.collection('students').doc(uid).set(
+        {'isActive': true},
+        SetOptions(merge: true),
+      );
 
-      // 4. Return student data
+      // 4. Return student data — ensure 'id' field equals uid
       final doc = await _firestore.collection('students').doc(uid).get();
       if (doc.exists) {
-        return Student.fromMap(doc.data()!);
+        final data = doc.data()!;
+        // Guarantee the id stored in the model matches the Firestore doc path
+        return Student.fromMap({...data, 'id': uid});
       }
     } catch (e) {
       rethrow;
@@ -413,13 +418,21 @@ class DatabaseHelper {
 
   Future<void> updateStudentProfile(String id, Map<String, dynamic> data) async {
     try {
-      await _firestore.collection('students').doc(id).update(data);
+      // Use set+merge so it works even if the document doesn't exist yet
+      await _firestore
+          .collection('students')
+          .doc(id)
+          .set(data, SetOptions(merge: true));
+
       final box = await _getBox(_studentsBoxName);
       final currentData = box.get(id);
       if (currentData != null) {
         final updatedData = Map<String, dynamic>.from(currentData);
         updatedData.addAll(data);
         await box.put(id, updatedData);
+      } else {
+        // If not in Hive yet, store the partial data so future reads work
+        await box.put(id, data);
       }
     } catch (e) {
       throw Exception('Failed to update student profile: $e');
